@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+yt-dlp
+aiogram
+discord.py
+python-dotenv
+pydantic
+requests
