@@ -1,0 +1,39 @@
+[
+    {
+        "name": "Poker Face",
+        "artists": [
+            "Lady Gaga"
+        ],
+        "artist": "Lady Gaga",
+        "genres": [
+            "",
+            ""
+        ],
+        "disc_number": 1,
+        "disc_count": 1,
+        "album_name": "The Fame",
+        "album_artist": "Lady Gaga",
+        "duration": 237,
+        "year": 2008,
+        "date": "2008-01-01",
+        "track_number": 4,
+        "tracks_count": 15,
+        "song_id": "1QV6tiMFM6fSOKOGLMHYYg",
+        "explicit": true,
+        "publisher": "Streamline/Interscope",
+        "url": "https://open.spotify.com/track/1QV6tiMFM6fSOKOGLMHYYg",
+        "isrc": "",
+        "cover_url": "https://i.scdn.co/image/ab67616d0000b273e691217483df8798445c82e2",
+        "copyright_text": "",
+        "download_url": null,
+        "lyrics": null,
+        "popularity": 10,
+        "album_id": "1qwlxZTNLe1jq3b0iidlue",
+        "list_name": null,
+        "list_url": null,
+        "list_position": null,
+        "list_length": null,
+        "artist_id": "1HY2Jd0NmPuamShAr6KMms",
+        "album_type": "album"
+    }
+]

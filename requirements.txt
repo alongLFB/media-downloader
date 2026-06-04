@@ -6,3 +6,4 @@ discord.py
 python-dotenv
 pydantic
 requests
+spotdl

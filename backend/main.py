@@ -3,6 +3,9 @@ from pydantic import BaseModel
 import yt_dlp
 import os
 import uuid
+import subprocess
+import json
+import sys
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -31,7 +34,43 @@ class DownloadRequest(BaseModel):
     title: Optional[str] = None
     
 @app.post("/api/info")
-async def get_info(req: ResolveRequest):
+def get_info(req: ResolveRequest):
+    if "spotify.com" in req.url:
+        task_id = str(uuid.uuid4())
+        temp_path = os.path.join(DOWNLOAD_DIR, f"{task_id}.spotdl")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "spotdl", "--print-errors", "save", req.url, "--save-file", temp_path],
+                check=True, capture_output=True, text=True
+            )
+            with open(temp_path, "r", encoding="utf-8") as f:
+                spotdl_data = json.load(f)
+            if not spotdl_data:
+                raise Exception("Failed to extract Spotify metadata")
+            song = spotdl_data[0]
+            return {
+                "title": f"{song.get('name', 'Unknown')} - {song.get('artist', 'Unknown')}",
+                "thumbnail": song.get("cover_url", ""),
+                "duration": song.get("duration", 0),
+                "formats": [
+                    {
+                        "format_id": "spotdl_mp3",
+                        "ext": "mp3",
+                        "resolution": "audio only",
+                        "filesize": None,
+                        "format_note": "Spotify Match (HQ MP3)",
+                        "vcodec": "none",
+                        "acodec": "mp3",
+                        "height": 0
+                    }
+                ]
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Spotify parsing failed: {str(e)}")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
     ydl_opts = {
         'quiet': True,
         'noplaylist': True,
@@ -127,6 +166,16 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
     
     def download_task():
         try:
+            if req.format_id == "spotdl_mp3":
+                output_path = os.path.join(DOWNLOAD_DIR, f"{task_id}.{{output-ext}}")
+                subprocess.run(
+                    [sys.executable, "-m", "spotdl", "--print-errors", req.url, "--output", output_path],
+                    check=True, capture_output=True, text=True
+                )
+                open(os.path.join(DOWNLOAD_DIR, f"{task_id}.done"), 'w').close()
+                print(f"Spotify 异步下载任务完成: {task_id}")
+                return
+                
             ydl_opts = {
                 'outtmpl': output_template,
                 'quiet': True,

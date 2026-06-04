@@ -100,7 +100,7 @@ export default function Home() {
   };
 
   // Group formats by audio/video for better display
-  const audioFormats = mediaInfo?.formats.filter(f => f.resolution === "audio only" && f.format_id === "bestaudio_mp3") || [];
+  const audioFormats = mediaInfo?.formats.filter(f => f.resolution === "audio only" && (f.format_id === "bestaudio_mp3" || f.format_id === "spotdl_mp3")) || [];
   const videoFormats = mediaInfo?.formats.filter(f => f.resolution !== "audio only") || [];
 
   return (
