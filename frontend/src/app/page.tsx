@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import axios from "axios";
-import { Search, Download, Play, Clock, FileVideo, FileAudio, Loader2 } from "lucide-react";
+import { Search, Download, Play, Clock, FileVideo, FileAudio, Loader2, ChevronDown, ChevronUp } from "lucide-react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
 
@@ -27,6 +27,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const [mediaInfo, setMediaInfo] = useState<MediaInfo | null>(null);
   const [downloadingFormat, setDownloadingFormat] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -49,7 +50,7 @@ export default function Home() {
   const handleDownload = async (formatId: string) => {
     setDownloadingFormat(formatId);
     try {
-      const res = await axios.post(`${BACKEND_URL}/api/download`, { url, format_id: formatId });
+      const res = await axios.post(`${BACKEND_URL}/api/download`, { url, format_id: formatId, title: mediaInfo?.title });
       const taskId = res.data.task_id;
       
       // Start polling for the file
@@ -99,7 +100,7 @@ export default function Home() {
   };
 
   // Group formats by audio/video for better display
-  const audioFormats = mediaInfo?.formats.filter(f => f.resolution === "audio only") || [];
+  const audioFormats = mediaInfo?.formats.filter(f => f.resolution === "audio only" && f.format_id === "bestaudio_mp3") || [];
   const videoFormats = mediaInfo?.formats.filter(f => f.resolution !== "audio only") || [];
 
   return (
@@ -182,7 +183,7 @@ export default function Home() {
                     <FileVideo className="w-4 h-4" /> Video Downloads
                   </h3>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {videoFormats.slice(0, 6).map((format) => (
+                    {(showAll ? videoFormats : videoFormats.slice(0, 6)).map((format) => (
                       <button
                         key={format.format_id}
                         onClick={() => handleDownload(format.format_id)}
@@ -191,7 +192,7 @@ export default function Home() {
                       >
                         <div className="flex flex-col items-start text-left">
                           <span className="font-medium text-white group-hover:text-indigo-400 transition-colors">
-                            {format.resolution === "audio only" ? format.format_note : format.resolution} ({format.ext})
+                            {format.resolution === "audio only" ? format.format_note : format.resolution} (mp4)
                           </span>
                           <span className="text-xs text-slate-500 mt-1">
                             {formatSize(format.filesize)}
@@ -215,7 +216,7 @@ export default function Home() {
                     <FileAudio className="w-4 h-4" /> Audio Downloads
                   </h3>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {audioFormats.slice(0, 4).map((format) => (
+                    {(showAll ? audioFormats : audioFormats.slice(0, 4)).map((format) => (
                       <button
                         key={format.format_id}
                         onClick={() => handleDownload(format.format_id)}
@@ -224,7 +225,7 @@ export default function Home() {
                       >
                         <div className="flex flex-col items-start text-left">
                           <span className="font-medium text-white group-hover:text-cyan-400 transition-colors">
-                            Audio {format.format_note || 'HQ'} ({format.ext})
+                            {format.ext === "mp3" ? format.format_note : `Audio ${format.format_note || 'HQ'} (${format.ext})`}
                           </span>
                           <span className="text-xs text-slate-500 mt-1">
                             {formatSize(format.filesize)}
@@ -238,6 +239,27 @@ export default function Home() {
                       </button>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* Show More / Show Less Button */}
+              {(videoFormats.length > 6 || audioFormats.length > 4) && (
+                <div className="flex justify-center pt-4 border-t border-slate-900/50">
+                  <button
+                    type="button"
+                    onClick={() => setShowAll(!showAll)}
+                    className="flex items-center gap-2 px-6 py-2.5 rounded-xl border border-slate-800 bg-slate-900/30 text-sm font-medium text-slate-400 hover:text-white hover:border-slate-700 hover:bg-slate-900/80 transition-all active:scale-95 cursor-pointer"
+                  >
+                    {showAll ? (
+                      <>
+                        Show Less <ChevronUp className="w-4 h-4" />
+                      </>
+                    ) : (
+                      <>
+                        Show More Options <ChevronDown className="w-4 h-4" />
+                      </>
+                    )}
+                  </button>
                 </div>
               )}
             </div>
