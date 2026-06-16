@@ -8,7 +8,23 @@ A unified media downloader service built with FastAPI, Next.js, aiogram (Telegra
 - **Telegram Bot**: Python bot using `aiogram`.
 - **Discord Bot**: Python bot using `discord.py`.
 
-## Setup Instructions
+## Docker Compose Setup (Recommended)
+
+The easiest way to run the entire stack is using Docker Compose. Make sure you have Docker and Docker Compose installed.
+
+1. Clone the repository and navigate into it.
+2. Create your `.env` file based on `.env.example`:
+```bash
+cp .env.example .env
+```
+3. Fill in your tokens in the `.env` file.
+4. Run the stack in the background using the modern `docker compose` command:
+```bash
+docker compose up -d
+```
+All services (backend, frontend, telegram-bot, discord-bot) will start automatically. To view logs, you can use `docker compose logs -f`. To stop the stack, run `docker compose down`.
+
+## Manual Setup Instructions
 
 ### 1. Prerequisites
 - Python 3.10+
