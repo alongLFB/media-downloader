@@ -60,3 +60,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Cookies and sensitive credentials
+*cookies*.txt
+*.cookies
+cookies/

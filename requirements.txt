@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-yt-dlp
+yt-dlp>=2026.8.19
+yt-dlp-ejs>=0.8.0
 aiogram
 discord.py
 python-dotenv

@@ -25,6 +25,18 @@ app.add_middleware(
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+def get_cookie_file():
+    candidates = [
+        os.path.join(os.getcwd(), "youtube-cookies.txt"),
+        os.path.join(os.path.dirname(__file__), "youtube-cookies.txt"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "youtube-cookies.txt"),
+        "youtube-cookies.txt"
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.path.getsize(c) > 0:
+            return c
+    return None
+
 class ResolveRequest(BaseModel):
     url: str
 
@@ -52,6 +64,8 @@ def get_info(req: ResolveRequest):
                 "title": f"{song.get('name', 'Unknown')} - {song.get('artist', 'Unknown')}",
                 "thumbnail": song.get("cover_url", ""),
                 "duration": song.get("duration", 0),
+                "uploader": song.get("artist", ""),
+                "extractor": "spotify",
                 "formats": [
                     {
                         "format_id": "spotdl_mp3",
@@ -74,7 +88,12 @@ def get_info(req: ResolveRequest):
     ydl_opts = {
         'quiet': True,
         'noplaylist': True,
+        'js_runtimes': {'node': {}, 'deno': {}},
     }
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
@@ -91,6 +110,7 @@ def get_info(req: ResolveRequest):
                 
                 res = f.get("resolution") or ""
                 filesize = f.get("filesize") or f.get("filesize_approx")
+                height = f.get("height") or 0
                 
                 fmt_data = {
                     "format_id": f.get("format_id"),
@@ -98,9 +118,10 @@ def get_info(req: ResolveRequest):
                     "resolution": res,
                     "filesize": filesize,
                     "format_note": f.get("format_note") or "",
-                    "height": f.get("height") or 0,
+                    "height": height,
                     "vcodec": vcodec,
                     "acodec": acodec,
+                    "fps": f.get("fps") or None,
                 }
                 
                 if vcodec == "none" or res == "audio only":
@@ -113,11 +134,11 @@ def get_info(req: ResolveRequest):
             video_formats.sort(key=lambda x: (x["height"], x["filesize"] or 0), reverse=True)
             audio_formats.sort(key=lambda x: x["filesize"] or 0, reverse=True)
             
-            # 去重
+            # 去重（按 resolution 或 height）
             seen_video = set()
             unique_video_formats = []
             for vf in video_formats:
-                key = (vf["resolution"], vf["ext"])
+                key = (vf["height"], vf["ext"]) if vf["height"] > 0 else (vf["resolution"], vf["ext"])
                 if key not in seen_video:
                     seen_video.add(key)
                     unique_video_formats.append(vf)
@@ -130,7 +151,7 @@ def get_info(req: ResolveRequest):
                     seen_audio.add(key)
                     unique_audio_formats.append(af)
             
-            # 虚拟 MP3 格式
+            # 虚拟最高品质 320kbps MP3 格式
             mp3_format = {
                 "format_id": "bestaudio_mp3",
                 "ext": "mp3",
@@ -139,20 +160,27 @@ def get_info(req: ResolveRequest):
                 "format_note": "320kbps (HQ MP3)",
                 "height": 0,
                 "vcodec": "none",
-                "acodec": "none",
+                "acodec": "mp3",
+                "fps": None,
             }
             unique_audio_formats.insert(0, mp3_format)
             
             final_formats = unique_video_formats + unique_audio_formats
             
             return {
-                "title": info.get("title"),
-                "thumbnail": info.get("thumbnail"),
-                "duration": info.get("duration"),
+                "title": info.get("title") or "Unknown Media",
+                "thumbnail": info.get("thumbnail") or "",
+                "duration": info.get("duration") or 0,
+                "uploader": info.get("uploader") or info.get("channel") or info.get("uploader_id") or "",
+                "extractor": info.get("extractor_key") or "generic",
+                "view_count": info.get("view_count") or None,
                 "formats": final_formats
             }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        err_msg = str(e)
+        if "The page needs to be reloaded" in err_msg:
+            err_msg = "YouTube 请求触发风控，请确保系统已安装最新 yt-dlp 与 challenge 求解器并配置有效 cookies。"
+        raise HTTPException(status_code=400, detail=err_msg)
 
 @app.post("/api/download")
 async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks):
@@ -161,7 +189,7 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
     if req.title:
         with open(os.path.join(DOWNLOAD_DIR, f"{task_id}.title"), "w", encoding="utf-8") as f:
             f.write(req.title)
-    # 恢复为 %(ext)s，让 yt-dlp 自动处理后缀替换（mp3或mp4），避免出现 .mp3.mp3
+            
     output_template = os.path.join(DOWNLOAD_DIR, f"{task_id}.%(ext)s")
     
     def download_task():
@@ -180,25 +208,25 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
                 'outtmpl': output_template,
                 'quiet': True,
                 'noplaylist': True,
+                'js_runtimes': {'node': {}, 'deno': {}},
             }
+            cookie_file = get_cookie_file()
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
             
             # 情况一：如果是高音质 MP3 请求
             if req.format_id == "bestaudio_mp3":
                 ydl_opts['format'] = 'bestaudio/best'
-                # 去除强制指定 .mp3 outtmpl，依靠 postprocessor 自动改后缀
                 ydl_opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '320',
                 }]
             
-            # 情况二：常规视频下载（强制将选中视频格式 + 最佳音频组合下载并转码）
+            # 情况二：常规视频下载（强制将选中视频格式 + 最佳音频组合下载并转码为通用 mp4）
             else:
-                # 组合语法：选中的视频 + 最佳音频
-                ydl_opts['format'] = f"{req.format_id}+bestaudio/best"
-                # 强制最终合并格式为 mp4
+                ydl_opts['format'] = f"{req.format_id}+bestaudio/best" if req.format_id != "best" else "bestvideo+bestaudio/best"
                 ydl_opts['merge_output_format'] = 'mp4'
-                # 核心修复：强制 FFmpeg 转换为 H.264(视频) + AAC(音频)，确保证浏览器能无缝播放
                 ydl_opts['postprocessor_args'] = {
                     'video_convertor': ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac']
                 }
@@ -213,10 +241,10 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
             
         except Exception as e:
             print(f"异步下载任务失败: {e}")
+            with open(os.path.join(DOWNLOAD_DIR, f"{task_id}.error"), 'w', encoding="utf-8") as f:
+                f.write(str(e))
             
-    # 每次下载前，自动清理一下 15 分钟以前的过期缓存
     cleanup_old_files()
-    
     background_tasks.add_task(download_task)
     return {"task_id": task_id, "status": "started"}
 
@@ -244,17 +272,27 @@ def cleanup_old_files():
 @app.api_route("/api/file/{task_id}", methods=["GET", "HEAD"])
 async def get_file(task_id: str, background_tasks: BackgroundTasks, request: Request):
     done_file = os.path.join(DOWNLOAD_DIR, f"{task_id}.done")
+    error_file = os.path.join(DOWNLOAD_DIR, f"{task_id}.error")
     
+    if os.path.exists(error_file):
+        err_text = "Download processing error"
+        try:
+            with open(error_file, "r", encoding="utf-8") as ef:
+                err_text = ef.read().strip()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=err_text)
+
     # 状态检查：.done 标记不存在说明还在下载中
     if not os.path.exists(done_file):
         if request.method == "HEAD":
             return Response(status_code=202)
-        raise HTTPException(status_code=404, detail="File not found or still downloading")
+        raise HTTPException(status_code=202, detail="Downloading and processing...")
         
     # 精确匹配最终生成的 .mp4 或 .mp3 媒体文件
     file_path = None
     filename = None
-    for ext in [".mp4", ".mp3"]:
+    for ext in [".mp4", ".mp3", ".webm", ".m4a"]:
         target_path = os.path.join(DOWNLOAD_DIR, f"{task_id}{ext}")
         if os.path.exists(target_path):
             file_path = target_path
@@ -268,17 +306,17 @@ async def get_file(task_id: str, background_tasks: BackgroundTasks, request: Req
                 with open(title_file, "r", encoding="utf-8") as f:
                     title = f.read().strip()
                     if title:
-                        safe_title = title.replace("/", "_").replace("\\", "_")
-                        filename = f"{safe_title}{ext}"
+                        safe_title = "".join([c for c in title if c.isalnum() or c in " ._-()"]).strip()
+                        if safe_title:
+                            filename = f"{safe_title}{os.path.splitext(file_path)[1]}"
             except Exception:
                 pass
                 
-        # 如果是 HEAD 请求（前端用来轮询状态），只返回 200，先不执行删除
         if request.method == "GET":
-            # 即用即焚机制：当文件开始流式传输给浏览器后，后台任务会在发送完自动干掉它们
             background_tasks.add_task(remove_file, file_path)
             background_tasks.add_task(remove_file, done_file)
-            background_tasks.add_task(remove_file, title_file)
+            if os.path.exists(title_file):
+                background_tasks.add_task(remove_file, title_file)
         return FileResponse(path=file_path, filename=filename)
             
     raise HTTPException(status_code=404, detail="File not found")
