@@ -25,12 +25,10 @@ import {
   Share2,
 } from "lucide-react";
 
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL !== undefined
-    ? process.env.NEXT_PUBLIC_BACKEND_URL
-    : typeof window !== "undefined"
-    ? ""
-    : "http://127.0.0.1:8000";
+const rawBackendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+const BACKEND_URL = rawBackendUrl !== undefined
+  ? rawBackendUrl.trim().replace(/^["']+|["']+$/g, "")
+  : "http://127.0.0.1:8000";
 
 interface Format {
   format_id: string;
@@ -134,7 +132,12 @@ export default function Home() {
       const hasVideo = res.data.formats?.some((f: Format) => f.resolution !== "audio only");
       setActiveTab(hasVideo ? "video" : "audio");
     } catch (err: any) {
-      const detail = err.response?.data?.detail || "无法解析此链接，请确认链接有效并支持公开访问。";
+      console.error("Fetch media info error:", err);
+      const detail =
+        err.response?.data?.detail ||
+        (err.response?.status
+          ? `接口异常 (${err.response.status}): 请确认服务正常且未被重定向`
+          : (err.message || "无法解析此链接，请确认链接有效并支持公开访问。"));
       setError(detail);
     } finally {
       setLoading(false);
