@@ -327,6 +327,60 @@ def get_info(req: ResolveRequest):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    # 检查是否为网易云电台/播客节目 (y.music.163.com/m/program 或 program?id=)
+    if "music.163.com" in req.url and ("program" in req.url or "dj" in req.url):
+        import re
+        match = re.search(r"id=(\d+)", req.url)
+        if match:
+            prog_id = match.group(1)
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://music.163.com/'
+                }
+                r = requests.get(f'https://music.163.com/api/dj/program/detail?id={prog_id}', headers=headers, timeout=10).json()
+                if r.get('code') == 200 and r.get('program'):
+                    prog = r['program']
+                    main_song = prog.get('mainSong', {})
+                    main_song_id = main_song.get('id')
+                    title = prog.get('name') or main_song.get('name') or "未知电台声音"
+                    dj_name = prog.get('dj', {}).get('nickname') or "网易云主播"
+                    cover_url = prog.get('coverUrl') or ""
+                    duration_s = int(prog.get('duration', 0) / 1000)
+
+                    filesize = None
+                    if main_song.get('bMusic'):
+                        filesize = main_song['bMusic'].get('size')
+                    elif main_song.get('hMusic'):
+                        filesize = main_song['hMusic'].get('size')
+
+                    # 预解析音频 URL
+                    player_res = requests.get(f'https://music.163.com/api/song/enhance/player/url?ids=[{main_song_id}]&br=320000', headers=headers, timeout=10).json()
+                    if player_res.get('code') == 200 and player_res.get('data') and player_res['data'][0].get('url'):
+                        if player_res['data'][0].get('size'):
+                            filesize = player_res['data'][0].get('size')
+                        return {
+                            "title": f"{title} - {dj_name}",
+                            "thumbnail": cover_url,
+                            "duration": duration_s,
+                            "uploader": dj_name,
+                            "extractor": "netease_dj",
+                            "formats": [
+                                {
+                                    "format_id": f"netease_program_{prog_id}_{main_song_id}",
+                                    "ext": "mp3",
+                                    "resolution": "audio only",
+                                    "filesize": filesize,
+                                    "format_note": "320kbps (网易云电台原声 MP3)",
+                                    "vcodec": "none",
+                                    "acodec": "mp3",
+                                    "height": 0
+                                }
+                            ]
+                        }
+            except Exception:
+                pass
+
     # 尝试使用 musicdl 解析音乐链接（支持网易云、QQ音乐、酷我、酷狗等链接）
     music_domains = ["music.163.com", "y.qq.com", "kuwo.cn", "kugou.com", "bodian.kuwo.cn"]
     if any(domain in req.url for domain in music_domains):
@@ -518,7 +572,30 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
     
     def download_task():
         try:
-            # 特殊情况 1：如果是 musicdl 链接下载
+            # 特殊情况 1：如果是网易云电台节目下载
+            if req.format_id.startswith("netease_program_"):
+                parts = req.format_id.split("_")
+                main_song_id = parts[-1] if len(parts) >= 4 else parts[2]
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://music.163.com/'
+                }
+                player_res = requests.get(f'https://music.163.com/api/song/enhance/player/url?ids=[{main_song_id}]&br=320000', headers=headers, timeout=10).json()
+                if not player_res.get('data') or not player_res['data'][0].get('url'):
+                    raise Exception("获取网易云电台音频流地址失败")
+                audio_url = player_res['data'][0]['url']
+                target_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, f"{task_id}.mp3"))
+                resp = requests.get(audio_url, headers=headers, stream=True, timeout=30)
+                resp.raise_for_status()
+                with open(target_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                open(os.path.join(DOWNLOAD_DIR, f"{task_id}.done"), 'w').close()
+                print(f"网易云电台异步下载任务完成: {task_id}")
+                return
+
+            # 特殊情况 2：如果是 musicdl 链接下载
             if req.format_id.startswith("musicdl_"):
                 init_cfg = {s["id"]: {"work_dir": os.path.abspath(DOWNLOAD_DIR), "disable_print": True} for s in AVAILABLE_MUSIC_SOURCES}
                 client = MusicClient(init_music_clients_cfg=init_cfg)
