@@ -333,6 +333,8 @@ def get_info(req: ResolveRequest):
         try:
             init_cfg = {s["id"]: {"work_dir": os.path.abspath(DOWNLOAD_DIR), "disable_print": True} for s in AVAILABLE_MUSIC_SOURCES}
             client = MusicClient(init_music_clients_cfg=init_cfg)
+            
+            # 1. 尝试歌单解析
             song_infos = client.parseplaylist(req.url)
             if song_infos:
                 song = song_infos[0]
@@ -355,8 +357,57 @@ def get_info(req: ResolveRequest):
                     "extractor": song.source.replace("MusicClient", "").lower(),
                     "formats": formats
                 }
+
+            # 2. 尝试单曲链接识别并精准检索 (网易云 & QQ音乐)
+            song_query = None
+            if "music.163.com" in req.url:
+                import re
+                match = re.search(r"id=(\d+)", req.url)
+                if match:
+                    song_id = match.group(1)
+                    r = requests.get(f"https://music.163.com/api/song/detail/?id={song_id}&ids=[{song_id}]", headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
+                    if r.get("songs"):
+                        s = r["songs"][0]
+                        singers = ", ".join([a.get("name", "") for a in s.get("artists", [])])
+                        song_query = f"{s.get('name', '')} {singers}".strip()
+            elif "y.qq.com" in req.url:
+                import re
+                match = re.search(r"songDetail/([a-zA-Z0-9]+)", req.url)
+                if match:
+                    mid = match.group(1)
+                    r = requests.get(f"https://u.y.qq.com/cgi-bin/musicu.fcg?data=%7B%22songinfo%22%3A%7B%22method%22%3A%22get_song_detail_yqq%22%2C%22param%22%3A%7B%22song_mid%22%3A%22{mid}%22%7D%2C%22module%22%3A%22music.pf_song_detail_svr%22%7D%7D", headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
+                    track = r.get("songinfo", {}).get("data", {}).get("track_info", {})
+                    if track.get("name"):
+                        singers = ", ".join([s.get("name", "") for s in track.get("singer", [])])
+                        song_query = f"{track.get('name')} {singers}".strip()
+
+            if song_query:
+                res = client.search(song_query)
+                all_found = []
+                for ms in ["KuwoMusicClient", "NeteaseMusicClient"]:
+                    all_found.extend(res.get(ms, []))
+                if all_found:
+                    best = all_found[0]
+                    ext = (best.ext or "flac").removeprefix(".").lower()
+                    return {
+                        "title": f"{best.song_name} - {best.singers}",
+                        "thumbnail": best.cover_url or "",
+                        "duration": best.duration_s or 0,
+                        "uploader": best.singers or "",
+                        "extractor": best.source.replace("MusicClient", "").lower(),
+                        "formats": [{
+                            "format_id": f"musicdl_{best.source}_{ext}",
+                            "ext": ext,
+                            "resolution": "audio only",
+                            "filesize": best.file_size_bytes,
+                            "format_note": f"{best.source.replace('MusicClient', '')} ({ext.upper()} {best.file_size or ''})",
+                            "vcodec": "none",
+                            "acodec": ext,
+                            "height": 0
+                        }]
+                    }
         except Exception:
-            pass  # 若 musicdl 解析失败，则回退到 yt-dlp
+            pass  # 若解析失败，则回退到 yt-dlp
                 
     ydl_opts = {
         'quiet': True,

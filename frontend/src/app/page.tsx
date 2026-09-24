@@ -267,6 +267,14 @@ export default function Home() {
     if (!kw) return;
     if (keywordOverride) setMusicQuery(kw);
 
+    // 智能识别：如果用户输入的是 URL（如 Spotify、YouTube、网易云等），自动无缝切换到链接解析模式
+    if (kw.startsWith("http://") || kw.startsWith("https://")) {
+      setActiveMode("video");
+      setVideoUrl(kw);
+      handleVideoSearch(undefined, kw);
+      return;
+    }
+
     setMusicLoading(true);
     setMusicError("");
     setMusicDownloadStatus("");
@@ -367,9 +375,11 @@ export default function Home() {
     }
   };
 
-  const handleVideoSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!videoUrl.trim()) return;
+  const handleVideoSearch = async (e?: React.FormEvent, customUrl?: string) => {
+    if (e) e.preventDefault();
+    const targetUrl = (customUrl !== undefined ? customUrl : videoUrl).trim();
+    if (!targetUrl) return;
+    if (customUrl) setVideoUrl(customUrl);
 
     setVideoLoading(true);
     setVideoError("");
@@ -378,7 +388,7 @@ export default function Home() {
     setVideoDownloadStatus("");
 
     try {
-      const res = await axios.post(`${BACKEND_URL}/api/info`, { url: videoUrl.trim() });
+      const res = await axios.post(`${BACKEND_URL}/api/info`, { url: targetUrl });
       setMediaInfo(res.data);
       const hasVideo = res.data.formats?.some((f: Format) => f.resolution !== "audio only");
       setVideoActiveTab(hasVideo ? "video" : "audio");
@@ -651,7 +661,7 @@ export default function Home() {
                     required
                     value={musicQuery}
                     onChange={(e) => setMusicQuery(e.target.value)}
-                    placeholder="输入歌名、歌手或音乐关键词 (如: 周杰伦 晴天, 富士山下...)"
+                    placeholder="输入歌名、歌手，或直接粘贴 Spotify / YouTube / 网易云歌曲链接..."
                     className="w-full bg-transparent text-white placeholder-slate-500 text-sm sm:text-base focus:outline-none py-2"
                   />
                   {musicQuery && (
