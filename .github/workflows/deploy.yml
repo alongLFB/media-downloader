@@ -1,0 +1,158 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '强制重新构建 Docker 镜像 (即使未检测到源码改动)'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy media-downloader
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          command_timeout: 30m
+          envs: ENV_FILE,FORCE_BUILD
+          script: |
+            set -euo pipefail
+
+            # 1. 锁定 GitHub 官方欧美骨干 IP（防止境外/甲骨文服务器 DNS 解析到不可达的节点）
+            if ! grep -q "140.82.112.3 github.com" /etc/hosts 2>/dev/null; then
+              sudo sed -i '/github.com/d' /etc/hosts 2>/dev/null || true
+              echo "140.82.112.3 github.com" | sudo tee -a /etc/hosts >/dev/null
+            fi
+
+            mkdir -p ~/github
+            cd ~/github
+
+            # 2. 获取或更新最新代码（带 30 秒超时与自动重试）
+            if [ ! -d "media-downloader" ]; then
+              for i in {1..3}; do
+                timeout 30s git clone https://github.com/alongLFB/media-downloader.git && break || { echo "Clone retry ($i/3)..."; sleep 2; }
+              done
+            fi
+            cd media-downloader
+
+            # 记录本次拉取前的 commit hash
+            OLD_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+            # 暂存服务器上的 YouTube cookies 凭据，防止被 git reset 覆盖
+            [ -f youtube-cookies.txt ] && cp youtube-cookies.txt /tmp/youtube-cookies.txt.bak 2>/dev/null || true
+
+            for i in {1..3}; do
+              timeout 30s git fetch origin master && break || { echo "Fetch retry ($i/3)..."; sleep 2; }
+            done
+            git reset --hard origin/master
+            NEW_HEAD=$(git rev-parse HEAD)
+
+            # 恢复服务器 cookies 文件，并确保空文件存在避免 docker-compose mount 报错为目录
+            [ -f /tmp/youtube-cookies.txt.bak ] && cp /tmp/youtube-cookies.txt.bak youtube-cookies.txt 2>/dev/null || true
+            touch youtube-cookies.txt
+
+            # 3. 确保下载缓存目录存在并具备写入权限
+            mkdir -p downloads
+            chmod -R 777 downloads 2>/dev/null || true
+
+            # 4. 同步环境变量（若 GitHub Secrets 已配置 ENV_FILE）
+            if [ -n "${ENV_FILE:-}" ]; then
+              printf "%s\n" "$ENV_FILE" > .env
+            fi
+
+            # 5. 智能判断是否需要重新构建 Docker 镜像 (按需构建)
+            SHOULD_BUILD=false
+            if [ "${FORCE_BUILD:-false}" = "true" ]; then
+              echo "==> [Trigger] 手动触发部署且指定了强制构建 (force_build=true)"
+              SHOULD_BUILD=true
+            elif [ -z "$OLD_HEAD" ]; then
+              echo "==> [Trigger] 首次部署，触发完整构建"
+              SHOULD_BUILD=true
+            elif [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
+              echo "==> [Trigger] 代码无新提交，当前版本已是最新 ($NEW_HEAD)"
+            else
+              CHANGED_FILES=$(git diff --name-only "$OLD_HEAD" "$NEW_HEAD" 2>/dev/null || echo "")
+              echo "==> 本次提交变更的文件列表 ($OLD_HEAD..$NEW_HEAD):"
+              echo "$CHANGED_FILES"
+
+              # 仅当改动涉及核心源码、依赖项或容器配置时才重新构建
+              if echo "$CHANGED_FILES" | grep -qE '^(backend/|frontend/|bots/|requirements\.txt|Dockerfile|compose\.yaml|\.env)'; then
+                echo "==> [Check] 检测到核心源码或容器配置变更，需要重新构建 Docker 镜像！"
+                SHOULD_BUILD=true
+              fi
+            fi
+
+            # 6. 执行按需构建与平滑重启容器
+            if [ "$SHOULD_BUILD" = "true" ]; then
+              echo "==> Building new Docker images in background (old containers keep serving)..."
+              docker compose build
+
+              echo "==> Waiting 3s to allow graceful container transition..."
+              sleep 3
+
+              echo "==> Re-creating containers atomically (seamless transition)..."
+              UP_SUCCESS=false
+              for i in {1..3}; do
+                if docker compose up -d --remove-orphans; then
+                  UP_SUCCESS=true
+                  break
+                fi
+                echo "Docker compose up retry ($i/3)..."
+                sleep 2
+              done
+
+              if [ "$UP_SUCCESS" != "true" ]; then
+                echo "❌ Failed to start containers after 3 attempts."
+                exit 1
+              fi
+
+              docker image prune -f
+
+              # 7. 自动化健康检查轮询（检查后端 API 与前端主页）
+              echo "==> Verifying Deployment Health..."
+              for i in {1..15}; do
+                BACKEND_OK=false
+                FRONTEND_OK=false
+
+                # 检查后端接口健康状态 (映射宿主机端口 8002)
+                if curl -s http://127.0.0.1:8002/docs 2>/dev/null | grep -qi "FastAPI" || curl -s http://127.0.0.1:8002/api/music/sources 2>/dev/null | grep -q "sources"; then
+                  BACKEND_OK=true
+                fi
+
+                # 检查前端页面响应 (映射宿主机端口 3031)
+                if curl -s -I http://127.0.0.1:3031 2>/dev/null | grep -qE "HTTP/1\.[01] (200|304)"; then
+                  FRONTEND_OK=true
+                fi
+
+                if [ "$BACKEND_OK" = "true" ] && [ "$FRONTEND_OK" = "true" ]; then
+                  echo "✅ Health check passed! Backend (:8002) and Frontend (:3031) are fully healthy."
+                  break
+                fi
+
+                echo "Waiting for services to become healthy ($i/15) [Backend: $BACKEND_OK, Frontend: $FRONTEND_OK]..."
+                sleep 3
+              done
+
+              echo "==> media-downloader deployment completed successfully!"
+            else
+              echo "==> ⚡ 本次仅改动了文档或非容器配置文件，无需重建镜像！"
+              echo "==> 远端代码已秒级同步至最新版本 ($NEW_HEAD)，旧容器保持零中断运行！"
+            fi
