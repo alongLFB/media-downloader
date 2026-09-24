@@ -8,3 +8,4 @@ python-dotenv
 pydantic
 requests
 spotdl
+musicdl>=2.14.0

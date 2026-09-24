@@ -1,4 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
 import os
@@ -6,10 +8,13 @@ import uuid
 import subprocess
 import json
 import sys
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from typing import Optional, List
 import time
+import requests
+import shutil
+
+from musicdl.musicdl import MusicClient
+from musicdl.modules.utils.data import SongInfo
 
 app = FastAPI(title="Media Downloader API")
 
@@ -44,7 +49,244 @@ class DownloadRequest(BaseModel):
     url: str
     format_id: Optional[str] = "best"
     title: Optional[str] = None
+
+# 支持的音乐平台列表定义
+AVAILABLE_MUSIC_SOURCES = [
+    {
+        "id": "KuwoMusicClient",
+        "name": "酷我音乐",
+        "badge": "酷我",
+        "desc": "无损FLAC / 320K MP3，高命中率",
+        "color": "emerald",
+        "default": True,
+    },
+    {
+        "id": "NeteaseMusicClient",
+        "name": "网易云音乐",
+        "badge": "网易云",
+        "desc": "海量热门曲目，高品质音源",
+        "color": "rose",
+        "default": True,
+    },
+    {
+        "id": "QQMusicClient",
+        "name": "QQ音乐",
+        "badge": "QQ音乐",
+        "desc": "官方主流曲库，经典流行",
+        "color": "amber",
+        "default": False,
+    },
+    {
+        "id": "KugouMusicClient",
+        "name": "酷狗音乐",
+        "badge": "酷狗",
+        "desc": "海量大众伴奏与热门单曲",
+        "color": "blue",
+        "default": False,
+    },
+    {
+        "id": "MiguMusicClient",
+        "name": "咪咕音乐",
+        "badge": "咪咕",
+        "desc": "原声品质，支持部分特有版权",
+        "color": "pink",
+        "default": False,
+    },
+    {
+        "id": "BilibiliMusicClient",
+        "name": "B站音频",
+        "badge": "Bilibili",
+        "desc": "二次元、同人与独立翻唱",
+        "color": "cyan",
+        "default": False,
+    },
+    {
+        "id": "BodianMusicClient",
+        "name": "波点音乐",
+        "badge": "波点",
+        "desc": "个性潮流与轻量曲库",
+        "color": "purple",
+        "default": False,
+    },
+]
+
+SOURCE_NAME_MAP = {s["id"]: s["name"] for s in AVAILABLE_MUSIC_SOURCES}
+SOURCE_BADGE_MAP = {s["id"]: s["badge"] for s in AVAILABLE_MUSIC_SOURCES}
+
+class MusicSearchRequest(BaseModel):
+    keyword: str
+    sources: Optional[List[str]] = None
+    count_per_source: Optional[int] = 5
+
+class MusicDownloadRequest(BaseModel):
+    song_info: dict
+    format: Optional[str] = None
+    title: Optional[str] = None
+
+@app.get("/api/music/sources")
+def get_music_sources():
+    return {"sources": AVAILABLE_MUSIC_SOURCES}
+
+@app.post("/api/music/search")
+def search_music(req: MusicSearchRequest):
+    keyword = req.keyword.strip()
+    if not keyword:
+        raise HTTPException(status_code=400, detail="搜索关键词不能为空")
+        
+    selected_sources = req.sources or [s["id"] for s in AVAILABLE_MUSIC_SOURCES if s["default"]]
+    valid_sources = [s for s in selected_sources if s in SOURCE_NAME_MAP]
+    if not valid_sources:
+        valid_sources = ["KuwoMusicClient", "NeteaseMusicClient"]
+        
+    count = max(1, min(req.count_per_source or 5, 10))
     
+    init_cfg = {
+        s: {
+            "work_dir": os.path.abspath(DOWNLOAD_DIR),
+            "search_size_per_source": count,
+            "disable_print": True
+        } for s in valid_sources
+    }
+    
+    try:
+        client = MusicClient(music_sources=valid_sources, init_music_clients_cfg=init_cfg)
+        raw_results = client.search(keyword)
+        
+        flat_results = []
+        for source_id, songs in raw_results.items():
+            for song in songs:
+                if not isinstance(song, SongInfo):
+                    continue
+                song_dict = song.todict()
+                song_id = f"{source_id}_{song.song_name}_{song.identifier or uuid.uuid4().hex[:8]}"
+                flat_results.append({
+                    "id": song_id,
+                    "song_name": song.song_name or "未知歌曲",
+                    "singers": song.singers or "未知歌手",
+                    "album": song.album or "",
+                    "source": source_id,
+                    "source_name": SOURCE_NAME_MAP.get(source_id, source_id.replace("MusicClient", "")),
+                    "source_badge": SOURCE_BADGE_MAP.get(source_id, source_id.replace("MusicClient", "")),
+                    "ext": (song.ext or "mp3").removeprefix(".").lower(),
+                    "file_size": song.file_size or "未知大小",
+                    "file_size_bytes": song.file_size_bytes,
+                    "duration": song.duration or "00:00",
+                    "duration_s": song.duration_s or 0,
+                    "cover_url": song.cover_url or "",
+                    "download_url": song.download_url if isinstance(song.download_url, str) else "",
+                    "has_lyric": bool(song.lyric),
+                    "song_info": song_dict,
+                })
+                
+        return {
+            "keyword": keyword,
+            "total": len(flat_results),
+            "results": flat_results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"音乐搜索发生异常: {str(e)}")
+
+@app.post("/api/music/download")
+async def download_music(req: MusicDownloadRequest, background_tasks: BackgroundTasks):
+    task_id = str(uuid.uuid4())
+    song_dict = req.song_info
+    
+    title = req.title
+    if not title:
+        song_name = song_dict.get("song_name") or "Track"
+        singers = song_dict.get("singers") or ""
+        title = f"{singers} - {song_name}" if singers else song_name
+        
+    with open(os.path.join(DOWNLOAD_DIR, f"{task_id}.title"), "w", encoding="utf-8") as f:
+        f.write(title)
+        
+    def music_download_task():
+        try:
+            song_obj = SongInfo.fromdict(song_dict)
+            source = song_obj.source or "KuwoMusicClient"
+            ext = (song_obj.ext or "mp3").removeprefix(".")
+            
+            target_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, f"{task_id}.{ext}"))
+            song_obj._save_path = target_path
+            song_obj.work_dir = os.path.abspath(DOWNLOAD_DIR)
+            
+            init_cfg = {
+                source: {
+                    "work_dir": os.path.abspath(DOWNLOAD_DIR),
+                    "disable_print": True
+                }
+            }
+            client = MusicClient(music_sources=[source], init_music_clients_cfg=init_cfg)
+            dl_res = client.download([song_obj])
+            
+            # 容错：如果保存路径与预期稍有差异，自动修正并移动
+            if not os.path.exists(target_path) and dl_res:
+                actual_path = dl_res[0].save_path
+                if os.path.exists(actual_path):
+                    shutil.move(actual_path, target_path)
+                    
+            if not os.path.exists(target_path):
+                # 再次扫描 downloads 文件夹看是否有以此 task_id 命名的文件
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if f.startswith(task_id) and not f.endswith((".done", ".title", ".error", ".lrc")):
+                        shutil.move(os.path.join(DOWNLOAD_DIR, f), target_path)
+                        break
+                        
+            if not os.path.exists(target_path):
+                raise Exception("音乐下载执行完成，但目标音频文件未在预期位置找到")
+                
+            open(os.path.join(DOWNLOAD_DIR, f"{task_id}.done"), "w").close()
+            print(f"MusicDL 下载任务成功完成: {task_id} -> {target_path}")
+        except Exception as e:
+            print(f"MusicDL 下载任务异常: {e}")
+            with open(os.path.join(DOWNLOAD_DIR, f"{task_id}.error"), "w", encoding="utf-8") as ef:
+                ef.write(str(e))
+                
+    cleanup_old_files()
+    background_tasks.add_task(music_download_task)
+    return {"task_id": task_id, "status": "started"}
+
+@app.get("/api/music/stream")
+def stream_music(url: str, request: Request):
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="无效的音频流播放地址")
+        
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    if "kuwo.cn" in url:
+        req_headers["Referer"] = "http://www.kuwo.cn"
+    elif "163.com" in url or "126.net" in url:
+        req_headers["Referer"] = "https://music.163.com/"
+    elif "qq.com" in url:
+        req_headers["Referer"] = "https://y.qq.com/"
+        
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["Range"] = range_header
+        
+    try:
+        resp = requests.get(url, headers=req_headers, stream=True, timeout=15)
+        
+        response_headers = {
+            "Content-Type": resp.headers.get("Content-Type", "audio/mpeg"),
+            "Accept-Ranges": "bytes",
+        }
+        if "Content-Length" in resp.headers:
+            response_headers["Content-Length"] = resp.headers["Content-Length"]
+        if "Content-Range" in resp.headers:
+            response_headers["Content-Range"] = resp.headers["Content-Range"]
+            
+        def iter_stream():
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+
+        status_code = resp.status_code if resp.status_code in [200, 206] else 200
+        return StreamingResponse(iter_stream(), status_code=status_code, headers=response_headers)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"试听音频流转发失败: {str(e)}")
+
 @app.post("/api/info")
 def get_info(req: ResolveRequest):
     if "spotify.com" in req.url:
@@ -84,6 +326,37 @@ def get_info(req: ResolveRequest):
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    # 尝试使用 musicdl 解析音乐链接（支持网易云、QQ音乐、酷我、酷狗等链接）
+    music_domains = ["music.163.com", "y.qq.com", "kuwo.cn", "kugou.com", "bodian.kuwo.cn"]
+    if any(domain in req.url for domain in music_domains):
+        try:
+            init_cfg = {s["id"]: {"work_dir": os.path.abspath(DOWNLOAD_DIR), "disable_print": True} for s in AVAILABLE_MUSIC_SOURCES}
+            client = MusicClient(init_music_clients_cfg=init_cfg)
+            song_infos = client.parseplaylist(req.url)
+            if song_infos:
+                song = song_infos[0]
+                ext = (song.ext or "flac").removeprefix(".").lower()
+                formats = [{
+                    "format_id": f"musicdl_{song.source}_{ext}",
+                    "ext": ext,
+                    "resolution": "audio only",
+                    "filesize": song.file_size_bytes,
+                    "format_note": f"{song.source.replace('MusicClient', '')} ({ext.upper()} {song.file_size or ''})",
+                    "vcodec": "none",
+                    "acodec": ext,
+                    "height": 0
+                }]
+                return {
+                    "title": f"{song.song_name} - {song.singers}",
+                    "thumbnail": song.cover_url or "",
+                    "duration": song.duration_s or 0,
+                    "uploader": song.singers or "",
+                    "extractor": song.source.replace("MusicClient", "").lower(),
+                    "formats": formats
+                }
+        except Exception:
+            pass  # 若 musicdl 解析失败，则回退到 yt-dlp
                 
     ydl_opts = {
         'quiet': True,
@@ -194,6 +467,28 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
     
     def download_task():
         try:
+            # 特殊情况 1：如果是 musicdl 链接下载
+            if req.format_id.startswith("musicdl_"):
+                init_cfg = {s["id"]: {"work_dir": os.path.abspath(DOWNLOAD_DIR), "disable_print": True} for s in AVAILABLE_MUSIC_SOURCES}
+                client = MusicClient(init_music_clients_cfg=init_cfg)
+                song_infos = client.parseplaylist(req.url)
+                if song_infos:
+                    song = song_infos[0]
+                    ext = (song.ext or "flac").removeprefix(".")
+                    target_path = os.path.abspath(os.path.join(DOWNLOAD_DIR, f"{task_id}.{ext}"))
+                    song._save_path = target_path
+                    song.work_dir = os.path.abspath(DOWNLOAD_DIR)
+                    client.download([song])
+                    if not os.path.exists(target_path):
+                        for f in os.listdir(DOWNLOAD_DIR):
+                            if f.startswith(task_id) and not f.endswith((".done", ".title", ".error", ".lrc")):
+                                shutil.move(os.path.join(DOWNLOAD_DIR, f), target_path)
+                                break
+                    open(os.path.join(DOWNLOAD_DIR, f"{task_id}.done"), 'w').close()
+                    print(f"MusicDL URL 异步下载完成: {task_id}")
+                    return
+
+            # 特殊情况 2：如果是 Spotify
             if req.format_id == "spotdl_mp3":
                 output_path = os.path.join(DOWNLOAD_DIR, f"{task_id}.{{output-ext}}")
                 subprocess.run(
@@ -214,7 +509,7 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
             if cookie_file:
                 ydl_opts['cookiefile'] = cookie_file
             
-            # 情况一：如果是高音质 MP3 请求
+            # 特殊情况 3：如果是高音质 MP3 请求
             if req.format_id == "bestaudio_mp3":
                 ydl_opts['format'] = 'bestaudio/best'
                 ydl_opts['postprocessors'] = [{
@@ -223,7 +518,7 @@ async def download_media(req: DownloadRequest, background_tasks: BackgroundTasks
                     'preferredquality': '320',
                 }]
             
-            # 情况二：常规视频下载（强制将选中视频格式 + 最佳音频组合下载并转码为通用 mp4）
+            # 特殊情况 4：常规视频下载（强制将选中视频格式 + 最佳音频组合下载并转码为通用 mp4）
             else:
                 ydl_opts['format'] = f"{req.format_id}+bestaudio/best" if req.format_id != "best" else "bestvideo+bestaudio/best"
                 ydl_opts['merge_output_format'] = 'mp4'
@@ -289,10 +584,10 @@ async def get_file(task_id: str, background_tasks: BackgroundTasks, request: Req
             return Response(status_code=202)
         raise HTTPException(status_code=202, detail="Downloading and processing...")
         
-    # 精确匹配最终生成的 .mp4 或 .mp3 媒体文件
+    # 精确匹配最终生成的媒体文件（包含无损 FLAC、WAV 等）
     file_path = None
     filename = None
-    for ext in [".mp4", ".mp3", ".webm", ".m4a"]:
+    for ext in [".mp4", ".mp3", ".flac", ".wav", ".webm", ".m4a", ".aac", ".ogg"]:
         target_path = os.path.join(DOWNLOAD_DIR, f"{task_id}{ext}")
         if os.path.exists(target_path):
             file_path = target_path
